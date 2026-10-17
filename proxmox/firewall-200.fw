@@ -1,0 +1,12 @@
+# Proxmox Firewall for VM 200 (gmaps-scraper)
+# Location: /etc/pve/firewall/200.fw
+
+[RULES]
+# Web UI access (port 58080)
+IN ACCEPT -p tcp -dport 58080
+
+# SSH (if needed)
+IN ACCEPT -p tcp -dport 22
+
+# Outbound: allow all (required for Docker pulls, API calls)
+OUT ACCEPT

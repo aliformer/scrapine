@@ -2,11 +2,13 @@ import { useState, useEffect } from "react"
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { Textarea } from "@/components/ui/textarea"
 import { Label } from "@/components/ui/label"
 import { JobTable } from "@/components/JobTable"
 import { CookieAuth } from "@/components/CookieAuth"
-import { getJobs, createJob } from "@/api/client"
-import type { Job, CreateJobRequest } from "@/types"
+import { TwitterFeedModal } from "@/components/TwitterFeedModal"
+import { getJobs, createJob, getJobTweets } from "@/api/client"
+import type { Job, CreateJobRequest, Tweet } from "@/types"
 import { Loader2, Twitter } from "lucide-react"
 import { useAuth } from "@/context/AuthContext"
 
@@ -23,6 +25,26 @@ export function TwitterPage() {
   const [query, setQuery] = useState("")
   const [cookie, setCookie] = useState("")
   const [depth, setDepth] = useState(1)
+  const [maxResults, setMaxResults] = useState(100)
+
+  const [selectedJob, setSelectedJob] = useState<{ id: string; name: string } | null>(null)
+  const [tweets, setTweets] = useState<Tweet[]>([])
+  const [feedLoading, setFeedLoading] = useState(false)
+  const [feedError, setFeedError] = useState<string | null>(null)
+
+  const handleViewJob = async (job: Job) => {
+    setSelectedJob({ id: job.id, name: job.name || job.id })
+    setFeedLoading(true)
+    setFeedError(null)
+    try {
+      const data = await getJobTweets(job.id)
+      setTweets(data)
+    } catch (err) {
+      setFeedError(err instanceof Error ? err.message : "Failed to load tweets")
+    } finally {
+      setFeedLoading(false)
+    }
+  }
 
   const handleConnectTwitter = async () => {
     setConnectingTwitter(true)
@@ -64,6 +86,7 @@ export function TwitterPage() {
       query: query.trim(),
       cookie: cookie.trim(),
       depth,
+      max_results: maxResults,
       keywords: [],
       lang: "en",
       zoom: 1,
@@ -143,19 +166,19 @@ export function TwitterPage() {
                 <Label htmlFor="username">Username (Optional)</Label>
                 <Input
                   id="username"
-                  placeholder="e.g., elonmusk"
+                  placeholder="e.g., elonmusk (comma- or newline-separated run in parallel)"
                   value={username}
                   onChange={(e) => setUsername(e.target.value)}
                 />
               </div>
             </div>
 
-            <div className="grid md:grid-cols-2 gap-4">
+            <div className="grid md:grid-cols-3 gap-4">
               <div className="space-y-2">
                 <Label htmlFor="query">Search Query / Hashtag (Optional)</Label>
                 <Input
                   id="query"
-                  placeholder="e.g., #golang OR #ai"
+                  placeholder="e.g., #golang, #ai (comma- or newline-separated run in parallel)"
                   value={query}
                   onChange={(e) => setQuery(e.target.value)}
                 />
@@ -172,15 +195,29 @@ export function TwitterPage() {
                   onChange={(e) => setDepth(parseInt(e.target.value) || 1)}
                 />
               </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="maxResults">Target Tweet Count</Label>
+                <Input
+                  id="maxResults"
+                  type="number"
+                  min={1}
+                  max={1000}
+                  value={maxResults}
+                  onChange={(e) => setMaxResults(parseInt(e.target.value) || 100)}
+                />
+              </div>
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="cookie">Auth Cookie / Token (Optional - falls back to cookie pool)</Label>
-              <Input
+              <Label htmlFor="cookie">Auth Cookies / Tokens (Optional - one per line for multiple accounts, or leave empty for cookie pool)</Label>
+              <Textarea
                 id="cookie"
-                placeholder="auth_token=...; ct0=..."
+                placeholder={"auth_token=acc1_token; ct0=acc1_csrf\nauth_token=acc2_token; ct0=acc2_csrf"}
                 value={cookie}
                 onChange={(e) => setCookie(e.target.value)}
+                rows={2}
+                className="font-mono text-xs"
               />
             </div>
 
@@ -202,10 +239,20 @@ export function TwitterPage() {
               <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
             </div>
           ) : (
-            <JobTable jobs={jobs} onJobDeleted={fetchJobs} onViewJob={() => {}} />
+            <JobTable jobs={jobs} onJobDeleted={fetchJobs} onViewJob={handleViewJob} />
           )}
         </CardContent>
       </Card>
+
+      {selectedJob && (
+        <TwitterFeedModal
+          job={selectedJob}
+          tweets={tweets}
+          loading={feedLoading}
+          error={feedError}
+          onClose={() => setSelectedJob(null)}
+        />
+      )}
     </div>
   )
 }

@@ -3,12 +3,19 @@ package threads
 import (
 	"context"
 	"encoding/json"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/gosom/scrapemate"
 
 	"github.com/gosom/google-maps-scraper/internal/jsonparse"
+)
+
+var (
+	threadsPostIDRegex = regexp.MustCompile(`(?:/post/|/t/)([A-Za-z0-9_-]+)`)
+	metricKMBRegexTh   = regexp.MustCompile(`(?i)([\d.]+)\s*([KMB])?`)
 )
 
 func parseThreadsResponse(ctx context.Context, resp *scrapemate.Response, job *ThreadsJob) (any, []scrapemate.IJob, error) {
@@ -19,21 +26,191 @@ func parseThreadsResponse(ctx context.Context, resp *scrapemate.Response, job *T
 		return posts, nextJobs, resp.Error
 	}
 
-	doc, ok := resp.Document.(*goquery.Document)
-	if !ok {
-		return posts, nextJobs, nil
+	// 1. Intercepted GraphQL responses
+	if resp.Meta != nil {
+		if captured, ok := resp.Meta["graphql_threads"].([]map[string]any); ok && len(captured) > 0 {
+			posts = extractPostsFromGraphQL(ctx, captured, job)
+			if len(posts) > 0 {
+				return posts, nextJobs, nil
+			}
+		}
 	}
 
-	// Threads embeds GraphQL data in <script type="application/json"> tags
-	posts = extractPostsFromScripts(doc, job)
-	if len(posts) > 0 {
-		return posts, nextJobs, nil
+	doc, _ := resp.Document.(*goquery.Document)
+	if doc == nil && len(resp.Body) > 0 {
+		doc, _ = goquery.NewDocumentFromReader(strings.NewReader(string(resp.Body)))
+	}
+
+	if doc != nil {
+		// 2. Embedded scripts in HTML
+		posts = extractPostsFromScripts(ctx, doc, job)
+		if len(posts) > 0 {
+			return posts, nextJobs, nil
+		}
+
+		// 3. DOM Fallback
+		posts = extractPostsFromDOM(ctx, doc, job)
+		if len(posts) > 0 {
+			return posts, nextJobs, nil
+		}
 	}
 
 	return posts, nextJobs, nil
 }
 
-func extractPostsFromScripts(doc *goquery.Document, job *ThreadsJob) []*Post {
+func extractPostsFromGraphQL(ctx context.Context, responses []map[string]any, job *ThreadsJob) []*Post {
+	var posts []*Post
+	seen := make(map[string]bool)
+
+	for _, respMap := range responses {
+		threadItems := jsonparse.FindByTypename(respMap, []string{
+			"XDTThreadItem",
+			"XDTThread",
+			"Thread",
+		}, 50)
+
+		for _, item := range threadItems {
+			post := extractPostFromThreadItem(item, job)
+			if post != nil && post.ID != "" && !seen[post.ID] {
+				if job.Deduper != nil && !job.Deduper.AddIfNotExists(ctx, post.ID) {
+					continue
+				}
+				seen[post.ID] = true
+				posts = append(posts, post)
+			}
+		}
+
+		postObjects := jsonparse.FindByKey(respMap, "thread_items", 30)
+		for _, obj := range postObjects {
+			items := jsonparse.GetSlice(obj, "thread_items")
+			for _, ti := range items {
+				if tiMap, ok := ti.(map[string]any); ok {
+					post := extractPostFromThreadItem(tiMap, job)
+					if post != nil && post.ID != "" && !seen[post.ID] {
+						if job.Deduper != nil && !job.Deduper.AddIfNotExists(ctx, post.ID) {
+							continue
+						}
+						seen[post.ID] = true
+						posts = append(posts, post)
+					}
+				}
+			}
+		}
+	}
+
+	return posts
+}
+
+func parseMetricCount(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	s = strings.ReplaceAll(s, ",", "")
+	matches := metricKMBRegexTh.FindStringSubmatch(s)
+	if len(matches) < 2 {
+		return 0
+	}
+	val, err := strconv.ParseFloat(matches[1], 64)
+	if err != nil {
+		return 0
+	}
+	multiplier := 1.0
+	if len(matches) >= 3 {
+		switch strings.ToUpper(matches[2]) {
+		case "K":
+			multiplier = 1_000
+		case "M":
+			multiplier = 1_000_000
+		case "B":
+			multiplier = 1_000_000_000
+		}
+	}
+	return int(val * multiplier)
+}
+
+func extractPostsFromDOM(ctx context.Context, doc *goquery.Document, job *ThreadsJob) []*Post {
+	var posts []*Post
+	seen := make(map[string]bool)
+
+	pageAuthor := job.Username
+
+	doc.Find(`div[data-pressable-container], div[data-testid*="post"]`).Each(func(i int, s *goquery.Selection) {
+		var postURL, postID string
+		s.Find(`a[href*="/post/"], a[href*="/t/"]`).Each(func(_ int, link *goquery.Selection) {
+			if postID != "" {
+				return
+			}
+			href, _ := link.Attr("href")
+			if m := threadsPostIDRegex.FindStringSubmatch(href); len(m) >= 2 {
+				postID = m[1]
+				postURL = href
+			}
+		})
+
+		if postID == "" {
+			return
+		}
+		if seen[postID] {
+			return
+		}
+		if job.Deduper != nil && !job.Deduper.AddIfNotExists(ctx, postID) {
+			return
+		}
+		seen[postID] = true
+
+		if !strings.HasPrefix(postURL, "http") {
+			postURL = "https://www.threads.net" + postURL
+		}
+
+		authorName := pageAuthor
+		if authorLink := s.Find(`a[href^="/@"]`).First(); authorLink.Length() > 0 {
+			href, _ := authorLink.Attr("href")
+			u := strings.TrimPrefix(href, "/@")
+			if idx := strings.Index(u, "/"); idx >= 0 {
+				u = u[:idx]
+			}
+			if u != "" {
+				authorName = u
+			}
+		}
+
+		text := ""
+		if msgEl := s.Find(`div[dir="auto"], span[dir="auto"]`).First(); msgEl.Length() > 0 {
+			text = strings.TrimSpace(msgEl.Text())
+		}
+
+		var metrics Metrics
+		s.Find(`div[role="button"], button`).Each(func(_ int, btn *goquery.Selection) {
+			txt := strings.TrimSpace(btn.Text())
+			aria, _ := btn.Attr("aria-label")
+			combined := strings.ToLower(txt + " " + aria)
+			switch {
+			case strings.Contains(combined, "like"):
+				metrics.Likes = parseMetricCount(txt)
+			case strings.Contains(combined, "repl"):
+				metrics.Replies = parseMetricCount(txt)
+			case strings.Contains(combined, "repost"):
+				metrics.Reposts = parseMetricCount(txt)
+			}
+		})
+
+		post := &Post{
+			ID:  postID,
+			URL: postURL,
+			Author: Profile{
+				Username: authorName,
+			},
+			Text:    text,
+			Metrics: metrics,
+		}
+		posts = append(posts, post)
+	})
+
+	return posts
+}
+
+func extractPostsFromScripts(ctx context.Context, doc *goquery.Document, job *ThreadsJob) []*Post {
 	var posts []*Post
 
 	doc.Find(`script[type="application/json"]`).Each(func(i int, s *goquery.Selection) {
@@ -81,6 +258,9 @@ func extractPostsFromScripts(doc *goquery.Document, job *ThreadsJob) []*Post {
 	var unique []*Post
 	for _, p := range posts {
 		if p.ID != "" && !seen[p.ID] {
+			if job.Deduper != nil && !job.Deduper.AddIfNotExists(ctx, p.ID) {
+				continue
+			}
 			seen[p.ID] = true
 			unique = append(unique, p)
 		}
@@ -116,7 +296,7 @@ func extractPostFromThreadItem(item map[string]any, job *ThreadsJob) *Post {
 			Bio:            jsonparse.GetString(user, "biography"),
 			AvatarURL:      jsonparse.GetString(user, "profile_pic_url"),
 			FollowersCount: jsonparse.GetInt(user, "follower_count"),
-			Verified:       jsonparse.GetString(user, "is_verified") == "true",
+			Verified:       jsonparse.GetBool(user, "is_verified"),
 		}
 	} else {
 		author = Profile{Username: job.Username}

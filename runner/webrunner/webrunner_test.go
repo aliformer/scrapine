@@ -118,3 +118,84 @@ func (r *memoryJobRepo) Update(_ context.Context, job *web.Job) error {
 	r.jobs[job.ID] = *job
 	return nil
 }
+
+func TestParseSocialTargets(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		username string
+		query    string
+		keywords []string
+		want     []socialTarget
+	}{
+		{
+			name:     "single user",
+			username: "alice",
+			query:    "",
+			keywords: nil,
+			want: []socialTarget{
+				{Username: "alice", Query: ""},
+			},
+		},
+		{
+			name:     "comma separated users with duplicates and spaces",
+			username: "alice, bob, alice , charlie",
+			query:    "",
+			keywords: nil,
+			want: []socialTarget{
+				{Username: "alice", Query: ""},
+				{Username: "bob", Query: ""},
+				{Username: "charlie", Query: ""},
+			},
+		},
+		{
+			name:     "newline separated queries",
+			username: "",
+			query:    "golang\npython\ngolang\nrust",
+			keywords: nil,
+			want: []socialTarget{
+				{Query: "golang"},
+				{Query: "python"},
+				{Query: "rust"},
+			},
+		},
+		{
+			name:     "keywords slice takes priority",
+			username: "alice, bob",
+			query:    "golang",
+			keywords: []string{"tag1", "tag2", "tag1"},
+			want: []socialTarget{
+				{Query: "tag1"},
+				{Query: "tag2"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseSocialTargets(tt.username, tt.query, tt.keywords)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %d targets, want %d: %+v", len(got), len(tt.want), got)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("at index %d: got %+v, want %+v", i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestResolveAccountCookies(t *testing.T) {
+	t.Parallel()
+
+	raw := "auth_token=tok1; ct0=cs1\n# comment\nauth_token=tok2; ct0=cs2\n\nauth_token=tok3; ct0=cs3"
+	cookies := resolveAccountCookies(raw, "twitter")
+	if len(cookies) != 3 {
+		t.Fatalf("expected 3 cookies, got %d", len(cookies))
+	}
+	if cookies[0] != "auth_token=tok1; ct0=cs1" || cookies[1] != "auth_token=tok2; ct0=cs2" || cookies[2] != "auth_token=tok3; ct0=cs3" {
+		t.Errorf("unexpected cookies parsed: %v", cookies)
+	}
+}

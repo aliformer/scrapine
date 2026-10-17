@@ -75,6 +75,7 @@ type JobData struct {
 	FastMode     bool          `json:"fast_mode"`
 	Radius       int           `json:"radius"`
 	Depth        int           `json:"depth"`
+	MaxResults   int           `json:"max_results,omitempty"`
 	Email        bool          `json:"email"`
 	ExtraReviews bool          `json:"extra_reviews"`
 	MaxTime      time.Duration `json:"max_time"`
@@ -84,13 +85,16 @@ type JobData struct {
 
 func (d *JobData) Validate() error {
 	switch strings.ToLower(strings.TrimSpace(d.Type)) {
-	case "twitter", "facebook", "tiktok":
+	case "twitter", "facebook", "tiktok", "threads":
 		if strings.TrimSpace(d.Username) == "" && strings.TrimSpace(d.Query) == "" {
 			return errors.New("username or query is required for social media job")
 		}
-	case "threads":
-		if strings.TrimSpace(d.Username) == "" {
-			return errors.New("username is required for Threads job")
+		if d.MaxResults <= 0 {
+			if d.Depth <= 1 {
+				d.MaxResults = 100
+			} else {
+				d.MaxResults = d.Depth * 20
+			}
 		}
 	default:
 		if len(d.Keywords) == 0 {

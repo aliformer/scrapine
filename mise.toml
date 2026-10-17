@@ -4,7 +4,7 @@ node = "20"
 
 [tasks.be]
 description = "Run backend server"
-run = "go run . -web -addr :58080"
+run = "go run . -web -addr :58080 -c 20"
 sources = ["**/*.go"]
 
 [tasks.fe]

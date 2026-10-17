@@ -6,10 +6,12 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/gosom/scrapemate"
+	"github.com/mxschmitt/playwright-go"
 
 	"github.com/gosom/google-maps-scraper/cookiepool"
 	"github.com/gosom/google-maps-scraper/deduper"
@@ -24,6 +26,7 @@ type FacebookJob struct {
 	Username    string
 	Query       string
 	MaxDepth    int
+	TargetCount int
 	Deduper     deduper.Deduper
 	ExitMonitor exiter.Exiter
 	Cookie      string
@@ -35,17 +38,21 @@ func NewFacebookJob(id, username, query string, maxDepth int, opts ...FacebookJo
 	}
 
 	var targetURL string
-	if username != "" {
+	switch {
+	case username != "" && query != "":
+		cleanUser := strings.TrimPrefix(username, "@")
+		targetURL = fmt.Sprintf("https://www.facebook.com/%s/search/?q=%s", cleanUser, url.QueryEscape(query))
+	case username != "":
 		targetURL = fmt.Sprintf("https://www.facebook.com/%s", strings.TrimPrefix(username, "@"))
-	} else if query != "" {
+	case query != "":
 		targetURL = fmt.Sprintf("https://www.facebook.com/search/top?q=%s", url.QueryEscape(query))
-	} else {
+	default:
 		targetURL = "https://www.facebook.com/"
 	}
 
 	const (
 		maxRetries = 3
-		p, prio    = scrapemate.PriorityLow, scrapemate.PriorityLow
+		prio       = scrapemate.PriorityLow
 	)
 
 	job := FacebookJob{
@@ -82,11 +89,21 @@ func NewFacebookJob(id, username, query string, maxDepth int, opts ...FacebookJo
 		opt(&job)
 	}
 
+	if job.TargetCount <= 0 {
+		job.TargetCount = 100
+	}
+
 	if job.Cookie != "" {
 		job.Headers["Cookie"] = job.Cookie
 	}
 
 	return &job
+}
+
+func WithTargetCount(count int) FacebookJobOptions {
+	return func(j *FacebookJob) {
+		j.TargetCount = count
+	}
 }
 
 func WithDeduper(d deduper.Deduper) FacebookJobOptions {
@@ -120,15 +137,12 @@ func (j *FacebookJob) ProcessOnFetchError() bool {
 func (j *FacebookJob) BrowserActions(ctx context.Context, page scrapemate.BrowserPage) scrapemate.Response {
 	var resp scrapemate.Response
 
-	if j.Cookie != "" {
-		_, _ = page.Goto("https://www.facebook.com/robots.txt", scrapemate.WaitUntilDOMContentLoaded)
-		parts := strings.Split(j.Cookie, ";")
-		for _, p := range parts {
-			if strings.TrimSpace(p) != "" {
-				_, _ = page.Eval(fmt.Sprintf(`document.cookie = %q`, strings.TrimSpace(p)))
-			}
-		}
-	}
+	pwPage, _ := page.Unwrap().(playwright.Page)
+
+	injectCookies(page, pwPage, j.Cookie)
+
+	cleanup, getResponses := attachGraphQLInterceptor(pwPage)
+	defer cleanup()
 
 	pageResponse, err := page.Goto(j.GetFullURL(), scrapemate.WaitUntilDOMContentLoaded)
 	if err != nil {
@@ -136,15 +150,57 @@ func (j *FacebookJob) BrowserActions(ctx context.Context, page scrapemate.Browse
 		return resp
 	}
 
-	// Wait for content or JSON data, fall back to timeout
-	err = page.WaitForSelector(`div[role="article"], script[type="application/json"]`, 5*time.Second)
-	if err != nil {
-		page.WaitForTimeout(3 * time.Second)
+	currentURL := page.URL()
+	if strings.Contains(currentURL, "/login") || strings.Contains(currentURL, "checkpoint") || strings.Contains(currentURL, "recover") {
+		resp.Error = fmt.Errorf("authentication required: redirected to %s", currentURL)
+		return resp
 	}
 
-	resp.URL = pageResponse.URL
-	resp.StatusCode = pageResponse.StatusCode
-	resp.Headers = pageResponse.Headers
+	if pageResponse != nil {
+		if pageResponse.StatusCode == 401 || pageResponse.StatusCode == 403 {
+			resp.Error = fmt.Errorf("authentication failed: HTTP %d", pageResponse.StatusCode)
+			return resp
+		}
+
+		if pageResponse.StatusCode == 429 {
+			resp.Error = fmt.Errorf("rate limited by Facebook: HTTP 429")
+			return resp
+		}
+	}
+
+	// Wait for content or JSON data, fall back to timeout
+	err = page.WaitForSelector(`div[role="article"], div[data-pagelet*="FeedUnit"], script[type="application/json"]`, 5*time.Second)
+	if err != nil {
+		page.WaitForTimeout(2 * time.Second)
+	}
+
+	maxDepth := j.MaxDepth
+	if maxDepth <= 0 {
+		maxDepth = 1
+	}
+
+	if scrollErr := scrollDown(ctx, page, maxDepth); scrollErr != nil {
+		resp.Error = scrollErr
+		return resp
+	}
+
+	if pageResponse != nil {
+		resp.URL = pageResponse.URL
+		resp.StatusCode = pageResponse.StatusCode
+		resp.Headers = pageResponse.Headers
+	}
+
+	if resp.URL == "" {
+		resp.URL = page.URL()
+	}
+
+	captured := getResponses()
+	if len(captured) > 0 {
+		if resp.Meta == nil {
+			resp.Meta = make(map[string]any)
+		}
+		resp.Meta["graphql_posts"] = captured
+	}
 
 	body, err := page.Content()
 	if err != nil {
@@ -156,7 +212,152 @@ func (j *FacebookJob) BrowserActions(ctx context.Context, page scrapemate.Browse
 	return resp
 }
 
+func injectCookies(page scrapemate.BrowserPage, pwPage playwright.Page, cookieStr string) {
+	if cookieStr == "" {
+		return
+	}
+
+	if pwPage != nil && pwPage.Context() != nil {
+		var pwCookies []playwright.OptionalCookie
+
+		for _, p := range strings.Split(cookieStr, ";") {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+
+			name, val, ok := strings.Cut(p, "=")
+			if !ok {
+				continue
+			}
+
+			name = strings.TrimSpace(name)
+			val = strings.TrimSpace(val)
+
+			if name == "" {
+				continue
+			}
+
+			isHTTPOnly := name == "xs" || name == "c_user" || name == "datr" || name == "sb" || name == "fr"
+			pwCookies = append(pwCookies, playwright.OptionalCookie{
+				Name:     name,
+				Value:    val,
+				Domain:   playwright.String(".facebook.com"),
+				Path:     playwright.String("/"),
+				Secure:   playwright.Bool(true),
+				HttpOnly: playwright.Bool(isHTTPOnly),
+			})
+		}
+
+		if len(pwCookies) > 0 {
+			_ = pwPage.Context().AddCookies(pwCookies)
+		}
+
+		return
+	}
+
+	for _, p := range strings.Split(cookieStr, ";") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			_, _ = page.Eval(fmt.Sprintf(`document.cookie = %q`, p+"; domain=.facebook.com; path=/; SameSite=Lax"))
+		}
+	}
+}
+
+func attachGraphQLInterceptor(pwPage playwright.Page) (func(), func() []map[string]any) {
+	if pwPage == nil {
+		return func() {}, func() []map[string]any { return nil }
+	}
+
+	var (
+		mu        sync.Mutex
+		responses []map[string]any
+	)
+
+	handler := func(pResponse playwright.Response) {
+		reqURL := pResponse.URL()
+		if !strings.Contains(reqURL, "/api/graphql/") {
+			return
+		}
+
+		if pResponse.Status() < 200 || pResponse.Status() >= 300 {
+			return
+		}
+
+		var data map[string]any
+		if err := pResponse.JSON(&data); err == nil && data != nil {
+			mu.Lock()
+			responses = append(responses, data)
+			mu.Unlock()
+		}
+	}
+
+	pwPage.OnResponse(handler)
+
+	cleanup := func() {
+		pwPage.RemoveListener("response", handler)
+	}
+
+	getResponses := func() []map[string]any {
+		mu.Lock()
+		defer mu.Unlock()
+
+		cp := make([]map[string]any, len(responses))
+		copy(cp, responses)
+
+		return cp
+	}
+
+	return cleanup, getResponses
+}
+
+func scrollDown(ctx context.Context, page scrapemate.BrowserPage, maxDepth int) error {
+	stuckCount := 0
+	lastHeight := 0
+
+	for i := 1; i < maxDepth; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		_, _ = page.Eval(`() => window.scrollTo(0, document.body.scrollHeight)`)
+		page.WaitForTimeout(2000 * time.Millisecond)
+
+		heightVal, evalErr := page.Eval(`() => document.body.scrollHeight`)
+		if evalErr == nil {
+			var currentHeight int
+			switch v := heightVal.(type) {
+			case int:
+				currentHeight = v
+			case float64:
+				currentHeight = int(v)
+			}
+
+			if currentHeight > 0 && currentHeight == lastHeight {
+				stuckCount++
+				if stuckCount >= 3 {
+					break
+				}
+
+				// Jiggle scroll slightly to trigger intersection observer
+				_, _ = page.Eval(`() => {
+					window.scrollBy(0, -200);
+					setTimeout(() => window.scrollTo(0, document.body.scrollHeight), 100);
+				}`)
+				page.WaitForTimeout(1000 * time.Millisecond)
+			} else {
+				stuckCount = 0
+				lastHeight = currentHeight
+			}
+		}
+	}
+
+	return nil
+}
+
 func (j *FacebookJob) Process(ctx context.Context, resp *scrapemate.Response) (any, []scrapemate.IJob, error) {
-	// ponytail: basic DOM scraper boilerplate. Upgrade to GraphQL API parsing if DOM structures drift.
+	// ponytail: basic DOM scraper boilerplate. Upgrade to mobile API signature extraction.
 	return parseFacebookResponse(ctx, resp, j)
 }

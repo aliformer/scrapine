@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gosom/google-maps-scraper/cookiepool"
 	"github.com/gosom/google-maps-scraper/deduper"
 	"github.com/gosom/google-maps-scraper/exiter"
 	"github.com/gosom/google-maps-scraper/facebook"
@@ -189,46 +190,148 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 
 	var seedJobs []scrapemate.IJob
 
+	maxResults := job.Data.MaxResults
+	if maxResults <= 0 {
+		if job.Data.Depth <= 1 {
+			maxResults = 100
+		} else {
+			maxResults = job.Data.Depth * 20
+		}
+	}
+
 	switch jobType {
 	case "twitter":
-		seedJobs = append(seedJobs, twitter.NewTwitterJob(
-			job.ID,
-			job.Data.Username,
-			job.Data.Query,
-			job.Data.Depth,
-			twitter.WithDeduper(dedup),
-			twitter.WithExitMonitor(exitMonitor),
-			twitter.WithCookie(job.Data.Cookie),
-		))
+		targets := parseSocialTargets(job.Data.Username, job.Data.Query, job.Data.Keywords)
+		if len(targets) == 0 {
+			targets = []socialTarget{{Username: job.Data.Username, Query: job.Data.Query}}
+		}
+		accounts := resolveAccountCookies(job.Data.Cookie, "twitter")
+		if len(targets) == 1 && len(accounts) > 1 {
+			single := targets[0]
+			targets = make([]socialTarget, len(accounts))
+			for i := range accounts {
+				targets[i] = single
+			}
+		}
+		targetPerSeed := maxResults / len(targets)
+		if targetPerSeed < 20 {
+			targetPerSeed = 20
+		}
+		for i, t := range targets {
+			var cookie string
+			if len(accounts) > 0 {
+				cookie = accounts[i%len(accounts)]
+			}
+			seedJobs = append(seedJobs, twitter.NewTwitterJob(
+				fmt.Sprintf("%s-%d", job.ID, i),
+				t.Username,
+				t.Query,
+				job.Data.Depth,
+				twitter.WithDeduper(dedup),
+				twitter.WithExitMonitor(exitMonitor),
+				twitter.WithCookie(cookie),
+				twitter.WithTargetCount(targetPerSeed),
+			))
+		}
 	case "threads":
-		seedJobs = append(seedJobs, threads.NewThreadsJob(
-			job.ID,
-			job.Data.Username,
-			job.Data.Depth,
-			threads.WithDeduper(dedup),
-			threads.WithExitMonitor(exitMonitor),
-			threads.WithCookie(job.Data.Cookie),
-		))
+		targets := parseSocialTargets(job.Data.Username, job.Data.Query, job.Data.Keywords)
+		if len(targets) == 0 {
+			targets = []socialTarget{{Username: job.Data.Username, Query: job.Data.Query}}
+		}
+		accounts := resolveAccountCookies(job.Data.Cookie, "threads")
+		if len(targets) == 1 && len(accounts) > 1 {
+			single := targets[0]
+			targets = make([]socialTarget, len(accounts))
+			for i := range accounts {
+				targets[i] = single
+			}
+		}
+		targetPerSeed := maxResults / len(targets)
+		if targetPerSeed < 20 {
+			targetPerSeed = 20
+		}
+		for i, t := range targets {
+			var cookie string
+			if len(accounts) > 0 {
+				cookie = accounts[i%len(accounts)]
+			}
+			seedJobs = append(seedJobs, threads.NewThreadsJob(
+				fmt.Sprintf("%s-%d", job.ID, i),
+				t.Username,
+				job.Data.Depth,
+				threads.WithQuery(t.Query),
+				threads.WithDeduper(dedup),
+				threads.WithExitMonitor(exitMonitor),
+				threads.WithCookie(cookie),
+				threads.WithTargetCount(targetPerSeed),
+			))
+		}
 	case "facebook":
-		seedJobs = append(seedJobs, facebook.NewFacebookJob(
-			job.ID,
-			job.Data.Username,
-			job.Data.Query,
-			job.Data.Depth,
-			facebook.WithDeduper(dedup),
-			facebook.WithExitMonitor(exitMonitor),
-			facebook.WithCookie(job.Data.Cookie),
-		))
+		targets := parseSocialTargets(job.Data.Username, job.Data.Query, job.Data.Keywords)
+		if len(targets) == 0 {
+			targets = []socialTarget{{Username: job.Data.Username, Query: job.Data.Query}}
+		}
+		accounts := resolveAccountCookies(job.Data.Cookie, "facebook")
+		if len(targets) == 1 && len(accounts) > 1 {
+			single := targets[0]
+			targets = make([]socialTarget, len(accounts))
+			for i := range accounts {
+				targets[i] = single
+			}
+		}
+		targetPerSeed := maxResults / len(targets)
+		if targetPerSeed < 20 {
+			targetPerSeed = 20
+		}
+		for i, t := range targets {
+			var cookie string
+			if len(accounts) > 0 {
+				cookie = accounts[i%len(accounts)]
+			}
+			seedJobs = append(seedJobs, facebook.NewFacebookJob(
+				fmt.Sprintf("%s-%d", job.ID, i),
+				t.Username,
+				t.Query,
+				job.Data.Depth,
+				facebook.WithDeduper(dedup),
+				facebook.WithExitMonitor(exitMonitor),
+				facebook.WithCookie(cookie),
+				facebook.WithTargetCount(targetPerSeed),
+			))
+		}
 	case "tiktok":
-		seedJobs = append(seedJobs, tiktok.NewTikTokJob(
-			job.ID,
-			job.Data.Username,
-			job.Data.Query,
-			job.Data.Depth,
-			tiktok.WithDeduper(dedup),
-			tiktok.WithExitMonitor(exitMonitor),
-			tiktok.WithCookie(job.Data.Cookie),
-		))
+		targets := parseSocialTargets(job.Data.Username, job.Data.Query, job.Data.Keywords)
+		if len(targets) == 0 {
+			targets = []socialTarget{{Username: job.Data.Username, Query: job.Data.Query}}
+		}
+		accounts := resolveAccountCookies(job.Data.Cookie, "tiktok")
+		if len(targets) == 1 && len(accounts) > 1 {
+			single := targets[0]
+			targets = make([]socialTarget, len(accounts))
+			for i := range accounts {
+				targets[i] = single
+			}
+		}
+		targetPerSeed := maxResults / len(targets)
+		if targetPerSeed < 20 {
+			targetPerSeed = 20
+		}
+		for i, t := range targets {
+			var cookie string
+			if len(accounts) > 0 {
+				cookie = accounts[i%len(accounts)]
+			}
+			seedJobs = append(seedJobs, tiktok.NewTikTokJob(
+				fmt.Sprintf("%s-%d", job.ID, i),
+				t.Username,
+				t.Query,
+				job.Data.Depth,
+				tiktok.WithDeduper(dedup),
+				tiktok.WithExitMonitor(exitMonitor),
+				tiktok.WithCookie(cookie),
+				tiktok.WithTargetCount(targetPerSeed),
+			))
+		}
 	default:
 		if len(job.Data.Keywords) == 0 {
 			job.Status = web.StatusFailed
@@ -314,17 +417,26 @@ func (w *webrunner) scrapeJob(ctx context.Context, job *web.Job) error {
 
 func defaultSetupMate(cfg *runner.Config) func(context.Context, io.Writer, *web.Job) (mateRunner, error) {
 	return func(_ context.Context, writer io.Writer, job *web.Job) (mateRunner, error) {
+		concurrency := cfg.Concurrency
+		if concurrency < 20 {
+			concurrency = 20
+		}
+
 		opts := []func(*scrapemateapp.Config) error{
-			scrapemateapp.WithConcurrency(cfg.Concurrency),
+			scrapemateapp.WithConcurrency(concurrency),
 			scrapemateapp.WithExitOnInactivity(time.Minute * 3),
 		}
 
 		isSocial := job.Data.Type == "twitter" || job.Data.Type == "threads" || job.Data.Type == "facebook" || job.Data.Type == "tiktok"
-		if !job.Data.FastMode || isSocial {
+		if isSocial && job.Data.FastMode {
+			// Social fast mode: direct HTTP fetcher without browser
+		} else if !job.Data.FastMode {
+			// Normal mode (Google Maps & Social): uses Playwright browser to execute BrowserActions
 			opts = append(opts,
 				scrapemateapp.WithJS(scrapemateapp.DisableImages()),
 			)
 		} else {
+			// Fast mode for Google Maps: uses HTTP stealth client with Tile/RPC API
 			opts = append(opts,
 				scrapemateapp.WithStealth("firefox"),
 			)
@@ -367,4 +479,68 @@ func defaultSetupMate(cfg *runner.Config) func(context.Context, io.Writer, *web.
 
 		return scrapemateapp.NewScrapeMateApp(matecfg)
 	}
+}
+
+type socialTarget struct {
+	Username string
+	Query    string
+}
+
+func parseSocialTargets(username, query string, keywords []string) []socialTarget {
+	var raw []socialTarget
+	if len(keywords) > 0 {
+		for _, kw := range keywords {
+			kw = strings.TrimSpace(kw)
+			if kw != "" {
+				raw = append(raw, socialTarget{Query: kw})
+			}
+		}
+	} else if strings.ContainsAny(username, ",\n") {
+		for _, u := range strings.FieldsFunc(username, func(r rune) bool { return r == ',' || r == '\n' }) {
+			u = strings.TrimSpace(u)
+			if u != "" {
+				raw = append(raw, socialTarget{Username: u})
+			}
+		}
+	} else if strings.ContainsAny(query, ",\n") {
+		for _, q := range strings.FieldsFunc(query, func(r rune) bool { return r == ',' || r == '\n' }) {
+			q = strings.TrimSpace(q)
+			if q != "" {
+				raw = append(raw, socialTarget{Query: q})
+			}
+		}
+	} else {
+		u := strings.TrimSpace(username)
+		q := strings.TrimSpace(query)
+		if u != "" || q != "" {
+			raw = append(raw, socialTarget{Username: u, Query: q})
+		}
+	}
+
+	seen := make(map[string]bool)
+	var targets []socialTarget
+	for _, t := range raw {
+		key := t.Username + "|" + t.Query
+		if !seen[key] && key != "|" {
+			seen[key] = true
+			targets = append(targets, t)
+		}
+	}
+	return targets
+}
+
+func resolveAccountCookies(rawCookie, platform string) []string {
+	var list []string
+	if rawCookie != "" {
+		for _, l := range strings.Split(rawCookie, "\n") {
+			l = strings.TrimSpace(l)
+			if l != "" && !strings.HasPrefix(l, "#") {
+				list = append(list, l)
+			}
+		}
+	}
+	if len(list) == 0 {
+		list = cookiepool.GetDefaultPool().GetAllCookies(platform)
+	}
+	return list
 }

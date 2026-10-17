@@ -107,3 +107,27 @@ func (p *Pool) GetCookie(platform string) string {
 
 	return cookie
 }
+
+func (p *Pool) GetAllCookies(platform string) []string {
+	platform = strings.ToLower(strings.TrimSpace(platform))
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	list, ok := p.cookies[platform]
+	if !ok || len(list) == 0 {
+		p.mu.Unlock()
+		_ = p.Load(platform)
+		p.mu.Lock()
+		list = p.cookies[platform]
+	}
+
+	if len(list) == 0 {
+		return nil
+	}
+
+	res := make([]string, len(list))
+	copy(res, list)
+
+	return res
+}

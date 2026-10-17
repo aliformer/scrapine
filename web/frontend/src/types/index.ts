@@ -16,6 +16,7 @@ export interface JobData {
   fast_mode: boolean
   radius: number
   depth: number
+  max_results?: number
   email: boolean
   extra_reviews: boolean
   max_time: number
@@ -35,6 +36,7 @@ export interface CreateJobRequest {
   fast_mode: boolean
   radius: number
   depth: number
+  max_results?: number
   email: boolean
   extra_reviews: boolean
   max_time: number
@@ -55,6 +57,21 @@ export interface Place {
   phone?: string
   website?: string
   category?: string
+}
+
+export interface Tweet {
+  id: string
+  url: string
+  author_username: string
+  author_name: string
+  text: string
+  created_at: string
+  replies: number
+  retweets: number
+  likes: number
+  views: number
+  is_reply: boolean
+  is_retweet: boolean
 }
 
 export interface ApiError {

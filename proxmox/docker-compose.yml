@@ -1,0 +1,34 @@
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: gmaps
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: gmaps
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gmaps"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  scraper:
+    image: gosom/google-maps-scraper:latest
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - playwright-cache:/opt
+      - ./queries:/queries:ro
+      - ./output:/out
+    command: >
+      -dsn postgres://gmaps:changeme@db:5432/gmaps?sslmode=disable
+      -c 2 -depth 1
+      -exit-on-inactivity 5m
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  playwright-cache:

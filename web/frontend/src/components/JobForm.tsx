@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import type { CreateJobRequest } from "@/types"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -11,6 +11,9 @@ import { TagsInput } from "@/components/ui/tags-input"
 import { LocationPicker } from "@/components/ui/location-picker"
 import { Loader2 } from "lucide-react"
 
+const JAKARTA_LAT = "-6.208763"
+const JAKARTA_LON = "106.845599"
+
 interface JobFormProps {
   onSubmit: (job: CreateJobRequest) => Promise<void>
   error: string | null
@@ -21,8 +24,25 @@ export function JobForm({ onSubmit, error }: JobFormProps) {
   const [keywords, setKeywords] = useState<string[]>([])
   const [lang, setLang] = useState("en")
   const [zoom, setZoom] = useState(15)
-  const [lat, setLat] = useState("")
-  const [lon, setLon] = useState("")
+  const [lat, setLat] = useState(JAKARTA_LAT)
+  const [lon, setLon] = useState(JAKARTA_LON)
+
+  useEffect(() => {
+    if ("geolocation" in navigator) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          setLat(pos.coords.latitude.toFixed(6))
+          setLon(pos.coords.longitude.toFixed(6))
+        },
+        () => {
+          // Fallback to Jakarta on error or permission denied
+          setLat(JAKARTA_LAT)
+          setLon(JAKARTA_LON)
+        },
+        { timeout: 5000, enableHighAccuracy: false }
+      )
+    }
+  }, [])
   const [fastMode, setFastMode] = useState(false)
   const [radius, setRadius] = useState(10000)
   const [depth, setDepth] = useState(10)
@@ -115,14 +135,43 @@ export function JobForm({ onSubmit, error }: JobFormProps) {
             <div className="space-y-4 pt-4">
               <div className="space-y-2">
                 <Label>Select Location</Label>
-                <LocationPicker
-                  lat={lat}
-                  lon={lon}
-                  zoom={zoom}
-                  onLatChange={setLat}
-                  onLonChange={setLon}
-                  onZoomChange={setZoom}
-                />
+                <div className="flex gap-2">
+                  <div className="flex-1">
+                    <LocationPicker
+                      lat={lat}
+                      lon={lon}
+                      zoom={zoom}
+                      onLatChange={setLat}
+                      onLonChange={setLon}
+                      onZoomChange={setZoom}
+                    />
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => {
+                      if ("geolocation" in navigator) {
+                        navigator.geolocation.getCurrentPosition(
+                          (pos) => {
+                            setLat(pos.coords.latitude.toFixed(6))
+                            setLon(pos.coords.longitude.toFixed(6))
+                          },
+                          () => {
+                            setLat(JAKARTA_LAT)
+                            setLon(JAKARTA_LON)
+                          },
+                          { timeout: 5000 }
+                        )
+                      } else {
+                        setLat(JAKARTA_LAT)
+                        setLon(JAKARTA_LON)
+                      }
+                    }}
+                    title="Use Current Location"
+                  >
+                    📍 Current Location
+                  </Button>
+                </div>
                 <div className="grid grid-cols-3 gap-2">
                   <div>
                     <Label className="text-xs">Lat</Label>
@@ -131,7 +180,7 @@ export function JobForm({ onSubmit, error }: JobFormProps) {
                       step="0.000001"
                       value={lat}
                       onChange={(e) => setLat(e.target.value)}
-                      placeholder="0.0"
+                      placeholder={JAKARTA_LAT}
                       className="h-8"
                     />
                   </div>
@@ -142,7 +191,7 @@ export function JobForm({ onSubmit, error }: JobFormProps) {
                       step="0.000001"
                       value={lon}
                       onChange={(e) => setLon(e.target.value)}
-                      placeholder="0.0"
+                      placeholder={JAKARTA_LON}
                       className="h-8"
                     />
                   </div>

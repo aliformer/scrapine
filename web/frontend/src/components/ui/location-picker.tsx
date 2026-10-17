@@ -23,6 +23,9 @@ interface LocationPickerProps {
   onZoomChange: (value: number) => void
 }
 
+const JAKARTA_LAT = -6.208763
+const JAKARTA_LON = 106.845599
+
 function MapEvents({ onLocationSelect, onZoomChange }: { 
   onLocationSelect: (lat: number, lon: number) => void
   onZoomChange: (zoom: number) => void 
@@ -53,9 +56,30 @@ function MapController({ lat, lon, zoom }: { lat: number; lon: number; zoom: num
 
 export function LocationPicker({ lat, lon, zoom, onLatChange, onLonChange, onZoomChange }: LocationPickerProps) {
   const [open, setOpen] = useState(false)
-  const [localLat, setLocalLat] = useState(parseFloat(lat) || 0)
-  const [localLon, setLocalLon] = useState(parseFloat(lon) || 0)
+  const [localLat, setLocalLat] = useState(parseFloat(lat) || JAKARTA_LAT)
+  const [localLon, setLocalLon] = useState(parseFloat(lon) || JAKARTA_LON)
   const [localZoom, setLocalZoom] = useState(zoom)
+
+  useEffect(() => {
+    setLocalLat(parseFloat(lat) || JAKARTA_LAT)
+    setLocalLon(parseFloat(lon) || JAKARTA_LON)
+  }, [lat, lon, open])
+
+  const handleUseCurrentLocation = () => {
+    if ("geolocation" in navigator) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          setLocalLat(pos.coords.latitude)
+          setLocalLon(pos.coords.longitude)
+        },
+        () => {
+          setLocalLat(JAKARTA_LAT)
+          setLocalLon(JAKARTA_LON)
+        },
+        { timeout: 5000 }
+      )
+    }
+  }
 
   const handleLocationSelect = (newLat: number, newLon: number) => {
     setLocalLat(newLat)
@@ -114,13 +138,21 @@ export function LocationPicker({ lat, lon, zoom, onLatChange, onLonChange, onZoo
                 onChange={(e) => setLocalZoom(parseInt(e.target.value) || 15)}
               />
             </div>
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={handleUseCurrentLocation}
+              title="Locate my current position"
+            >
+              📍 Locate Me
+            </Button>
           </div>
           <p className="text-sm text-muted-foreground">
-            Click on the map to select a location. The marker shows the selected position.
+            Click on the map to select a location. Defaulting to current location or Jakarta.
           </p>
           <div className="flex-1 min-h-[400px] rounded-lg overflow-hidden border">
             <MapContainer
-              center={[localLat || 51.505, localLon || -0.09]}
+              center={[localLat || JAKARTA_LAT, localLon || JAKARTA_LON]}
               zoom={localZoom}
               style={{ height: "100%", width: "100%" }}
             >

@@ -4,12 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/gosom/scrapemate"
 
 	"github.com/gosom/google-maps-scraper/internal/jsonparse"
+)
+
+var (
+	tiktokVideoIDRegex = regexp.MustCompile(`/video/(\d+)`)
+	metricKMBRegex     = regexp.MustCompile(`(?i)([\d.]+)\s*([KMB])?`)
 )
 
 func parseTikTokResponse(ctx context.Context, resp *scrapemate.Response, job *TikTokJob) (any, []scrapemate.IJob, error) {
@@ -20,30 +26,219 @@ func parseTikTokResponse(ctx context.Context, resp *scrapemate.Response, job *Ti
 		return videos, nextJobs, resp.Error
 	}
 
-	doc, ok := resp.Document.(*goquery.Document)
-	if !ok {
-		return videos, nextJobs, nil
+	// 1. Intercepted API responses
+	if resp.Meta != nil {
+		if captured, ok := resp.Meta["api_videos"].([]map[string]any); ok && len(captured) > 0 {
+			videos = extractVideosFromAPI(ctx, captured, job)
+			if len(videos) > 0 {
+				return videos, nextJobs, nil
+			}
+		}
 	}
 
-	// Try __UNIVERSAL_DATA_FOR_REHYDRATION__ first (modern TikTok)
-	if data, found := jsonparse.FindScriptJSONByID(doc, "__UNIVERSAL_DATA_FOR_REHYDRATION__"); found {
-		videos = extractFromUniversalData(data, job)
+	doc, _ := resp.Document.(*goquery.Document)
+	if doc == nil && len(resp.Body) > 0 {
+		doc, _ = goquery.NewDocumentFromReader(strings.NewReader(string(resp.Body)))
+	}
+
+	if doc != nil {
+		// 2. Try __UNIVERSAL_DATA_FOR_REHYDRATION__ (modern TikTok)
+		if data, found := jsonparse.FindScriptJSONByID(doc, "__UNIVERSAL_DATA_FOR_REHYDRATION__"); found {
+			videos = extractFromUniversalData(ctx, data, job)
+			if len(videos) > 0 {
+				return videos, nextJobs, nil
+			}
+		}
+
+		// 3. Fallback: try SIGI_STATE (older TikTok)
+		videos = extractFromSigiState(ctx, doc, job)
+		if len(videos) > 0 {
+			return videos, nextJobs, nil
+		}
+
+		// 4. DOM Fallback
+		videos = extractVideosFromDOM(ctx, doc, job)
 		if len(videos) > 0 {
 			return videos, nextJobs, nil
 		}
 	}
 
-	// Fallback: try SIGI_STATE (older TikTok)
-	videos = extractFromSigiState(doc, job)
-	if len(videos) > 0 {
-		return videos, nextJobs, nil
-	}
-
-	// Last resort: return empty with page info for debugging
 	return videos, nextJobs, nil
 }
 
-func extractFromUniversalData(data map[string]any, job *TikTokJob) []*Video {
+func extractVideosFromAPI(ctx context.Context, responses []map[string]any, job *TikTokJob) []*Video {
+	var videos []*Video
+	seen := make(map[string]bool)
+
+	for _, respMap := range responses {
+		var items []any
+		if list := jsonparse.GetSlice(respMap, "itemList"); len(list) > 0 {
+			items = list
+		} else if list := jsonparse.GetSlice(respMap, "item_list"); len(list) > 0 {
+			items = list
+		} else if list := jsonparse.GetSlice(respMap, "data"); len(list) > 0 {
+			items = list
+		} else if dataMap := jsonparse.GetMap(respMap, "data"); dataMap != nil {
+			if list := jsonparse.GetSlice(dataMap, "item_list"); len(list) > 0 {
+				items = list
+			} else if list := jsonparse.GetSlice(dataMap, "itemList"); len(list) > 0 {
+				items = list
+			}
+		}
+
+		for _, item := range items {
+			itemMap, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+
+			if innerItem := jsonparse.GetMap(itemMap, "item"); innerItem != nil {
+				itemMap = innerItem
+			}
+
+			video := extractVideoFromItem(itemMap, nil, job)
+			if video != nil && video.ID != "" && !seen[video.ID] {
+				if job.Deduper != nil && !job.Deduper.AddIfNotExists(ctx, video.ID) {
+					continue
+				}
+				seen[video.ID] = true
+				videos = append(videos, video)
+			}
+		}
+	}
+
+	return videos
+}
+
+func parseMetricCount(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	s = strings.ReplaceAll(s, ",", "")
+	matches := metricKMBRegex.FindStringSubmatch(s)
+	if len(matches) < 2 {
+		return 0
+	}
+	val, err := strconv.ParseFloat(matches[1], 64)
+	if err != nil {
+		return 0
+	}
+	multiplier := 1.0
+	if len(matches) >= 3 {
+		switch strings.ToUpper(matches[2]) {
+		case "K":
+			multiplier = 1_000
+		case "M":
+			multiplier = 1_000_000
+		case "B":
+			multiplier = 1_000_000_000
+		}
+	}
+	return int(val * multiplier)
+}
+
+func extractVideosFromDOM(ctx context.Context, doc *goquery.Document, job *TikTokJob) []*Video {
+	var videos []*Video
+	seen := make(map[string]bool)
+
+	pageAuthor := job.Username
+	if h1 := doc.Find(`h1[data-e2e="user-title"], h2[data-e2e="user-subtitle"]`).First(); h1.Length() > 0 {
+		txt := strings.TrimSpace(h1.Text())
+		if txt != "" {
+			pageAuthor = strings.TrimPrefix(txt, "@")
+		}
+	}
+
+	doc.Find(`div[data-e2e="user-post-item"], div[data-e2e="search_top-item"], div[data-e2e="search-card-like-container"], div[data-e2e="challenge-item"]`).Each(func(_ int, s *goquery.Selection) {
+		link := s.Find(`a[href*="/video/"]`).First()
+		if link.Length() == 0 {
+			return
+		}
+		href, _ := link.Attr("href")
+		m := tiktokVideoIDRegex.FindStringSubmatch(href)
+		if len(m) < 2 {
+			return
+		}
+		id := m[1]
+		if seen[id] {
+			return
+		}
+		if job.Deduper != nil && !job.Deduper.AddIfNotExists(ctx, id) {
+			return
+		}
+		seen[id] = true
+
+		authorName := pageAuthor
+		if cardUser := s.Find(`span[data-e2e="search-card-user-unique-id"], a[data-e2e="search-card-user-link"]`).First(); cardUser.Length() > 0 {
+			if u := strings.TrimSpace(cardUser.Text()); u != "" {
+				authorName = strings.TrimPrefix(u, "@")
+			}
+		}
+
+		desc := strings.TrimSpace(s.Find(`div[data-e2e="user-post-item-desc"], div[data-e2e="search-card-video-caption"]`).Text())
+		if desc == "" {
+			desc, _ = link.Attr("title")
+		}
+
+		viewsStr := strings.TrimSpace(s.Find(`strong[data-e2e="video-views"], span[data-e2e="search-card-like-count"]`).Text())
+		views := parseMetricCount(viewsStr)
+
+		videoURL := href
+		if !strings.HasPrefix(videoURL, "http") {
+			videoURL = "https://www.tiktok.com" + videoURL
+		}
+
+		v := &Video{
+			ID:  id,
+			URL: videoURL,
+			Author: Profile{
+				Username: authorName,
+			},
+			Description: desc,
+			Metrics: Metrics{
+				Views: views,
+			},
+		}
+		videos = append(videos, v)
+	})
+
+	if len(videos) == 0 {
+		doc.Find(`a[href*="/video/"]`).Each(func(_ int, s *goquery.Selection) {
+			href, _ := s.Attr("href")
+			m := tiktokVideoIDRegex.FindStringSubmatch(href)
+			if len(m) < 2 {
+				return
+			}
+			id := m[1]
+			if seen[id] {
+				return
+			}
+			if job.Deduper != nil && !job.Deduper.AddIfNotExists(ctx, id) {
+				return
+			}
+			seen[id] = true
+
+			videoURL := href
+			if !strings.HasPrefix(videoURL, "http") {
+				videoURL = "https://www.tiktok.com" + videoURL
+			}
+
+			videos = append(videos, &Video{
+				ID:  id,
+				URL: videoURL,
+				Author: Profile{
+					Username: pageAuthor,
+				},
+				Description: strings.TrimSpace(s.Text()),
+			})
+		})
+	}
+
+	return videos
+}
+
+func extractFromUniversalData(ctx context.Context, data map[string]any, job *TikTokJob) []*Video {
 	var videos []*Video
 
 	// Path: __DEFAULT_SCOPE__ -> webapp.user-detail -> userInfo for profile
@@ -65,7 +260,10 @@ func extractFromUniversalData(data map[string]any, job *TikTokJob) []*Video {
 		for _, item := range itemList {
 			if itemMap, ok := item.(map[string]any); ok {
 				video := extractVideoFromItem(itemMap, user, job)
-				if video != nil {
+				if video != nil && video.ID != "" {
+					if job.Deduper != nil && !job.Deduper.AddIfNotExists(ctx, video.ID) {
+						continue
+					}
 					videos = append(videos, video)
 				}
 			}
@@ -79,8 +277,10 @@ func extractFromUniversalData(data map[string]any, job *TikTokJob) []*Video {
 		itemStruct := jsonparse.GetMap(itemInfo, "itemStruct")
 		if itemStruct != nil {
 			video := extractVideoFromItem(itemStruct, nil, job)
-			if video != nil {
-				videos = append(videos, video)
+			if video != nil && video.ID != "" {
+				if job.Deduper == nil || job.Deduper.AddIfNotExists(ctx, video.ID) {
+					videos = append(videos, video)
+				}
 			}
 		}
 	}
@@ -141,7 +341,7 @@ func extractVideoFromItem(item map[string]any, defaultUser map[string]any, job *
 	}
 }
 
-func extractFromSigiState(doc *goquery.Document, job *TikTokJob) []*Video {
+func extractFromSigiState(ctx context.Context, doc *goquery.Document, job *TikTokJob) []*Video {
 	var videos []*Video
 
 	// Find SIGI_STATE in script tags
@@ -169,7 +369,10 @@ func extractFromSigiState(doc *goquery.Document, job *TikTokJob) []*Video {
 			for _, v := range itemModule {
 				if itemMap, ok := v.(map[string]any); ok {
 					video := extractVideoFromItem(itemMap, nil, job)
-					if video != nil {
+					if video != nil && video.ID != "" {
+						if job.Deduper != nil && !job.Deduper.AddIfNotExists(ctx, video.ID) {
+							continue
+						}
 						videos = append(videos, video)
 					}
 				}

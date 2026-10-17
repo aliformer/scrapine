@@ -6,10 +6,12 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/gosom/scrapemate"
+	"github.com/mxschmitt/playwright-go"
 
 	"github.com/gosom/google-maps-scraper/cookiepool"
 	"github.com/gosom/google-maps-scraper/deduper"
@@ -24,6 +26,7 @@ type TikTokJob struct {
 	Username    string
 	Query       string
 	MaxDepth    int
+	TargetCount int
 	Deduper     deduper.Deduper
 	ExitMonitor exiter.Exiter
 	Cookie      string
@@ -35,12 +38,16 @@ func NewTikTokJob(id, username, query string, maxDepth int, opts ...TikTokJobOpt
 	}
 
 	var targetURL string
-	if username != "" {
+	switch {
+	case username != "" && query != "":
+		cleanUser := strings.TrimPrefix(username, "@")
+		targetURL = fmt.Sprintf("https://www.tiktok.com/search?q=%s", url.QueryEscape(fmt.Sprintf("%s %s", cleanUser, query)))
+	case username != "":
 		targetURL = fmt.Sprintf("https://www.tiktok.com/@%s", strings.TrimPrefix(username, "@"))
-	} else if query != "" {
+	case query != "":
 		targetURL = fmt.Sprintf("https://www.tiktok.com/search?q=%s", url.QueryEscape(query))
-	} else {
-		targetURL = "https://www.tiktok.com/"
+	default:
+		targetURL = "https://www.tiktok.com/explore"
 	}
 
 	const (
@@ -82,11 +89,21 @@ func NewTikTokJob(id, username, query string, maxDepth int, opts ...TikTokJobOpt
 		opt(&job)
 	}
 
+	if job.TargetCount <= 0 {
+		job.TargetCount = 100
+	}
+
 	if job.Cookie != "" {
 		job.Headers["Cookie"] = job.Cookie
 	}
 
 	return &job
+}
+
+func WithTargetCount(count int) TikTokJobOptions {
+	return func(j *TikTokJob) {
+		j.TargetCount = count
+	}
 }
 
 func WithDeduper(d deduper.Deduper) TikTokJobOptions {
@@ -120,15 +137,12 @@ func (j *TikTokJob) ProcessOnFetchError() bool {
 func (j *TikTokJob) BrowserActions(ctx context.Context, page scrapemate.BrowserPage) scrapemate.Response {
 	var resp scrapemate.Response
 
-	if j.Cookie != "" {
-		_, _ = page.Goto("https://www.tiktok.com/robots.txt", scrapemate.WaitUntilDOMContentLoaded)
-		parts := strings.Split(j.Cookie, ";")
-		for _, p := range parts {
-			if strings.TrimSpace(p) != "" {
-				_, _ = page.Eval(fmt.Sprintf(`document.cookie = %q`, strings.TrimSpace(p)))
-			}
-		}
-	}
+	pwPage, _ := page.Unwrap().(playwright.Page)
+
+	injectCookies(page, pwPage, j.Cookie)
+
+	cleanup, getResponses := attachAPIInterceptor(pwPage)
+	defer cleanup()
 
 	pageResponse, err := page.Goto(j.GetFullURL(), scrapemate.WaitUntilDOMContentLoaded)
 	if err != nil {
@@ -136,15 +150,57 @@ func (j *TikTokJob) BrowserActions(ctx context.Context, page scrapemate.BrowserP
 		return resp
 	}
 
-	// Wait for JSON data script or content, fall back to timeout
-	err = page.WaitForSelector(`script#__UNIVERSAL_DATA_FOR_REHYDRATION__, div[data-e2e="user-post-item"]`, 5*time.Second)
-	if err != nil {
-		page.WaitForTimeout(3 * time.Second)
+	currentURL := page.URL()
+	if strings.Contains(currentURL, "/login") || strings.Contains(currentURL, "passport/web/") || strings.Contains(currentURL, "verify") {
+		resp.Error = fmt.Errorf("authentication or verification required: redirected to %s", currentURL)
+		return resp
 	}
 
-	resp.URL = pageResponse.URL
-	resp.StatusCode = pageResponse.StatusCode
-	resp.Headers = pageResponse.Headers
+	if pageResponse != nil {
+		if pageResponse.StatusCode == 401 || pageResponse.StatusCode == 403 {
+			resp.Error = fmt.Errorf("authentication failed: HTTP %d", pageResponse.StatusCode)
+			return resp
+		}
+
+		if pageResponse.StatusCode == 429 {
+			resp.Error = fmt.Errorf("rate limited by TikTok: HTTP 429")
+			return resp
+		}
+	}
+
+	// Wait for JSON data script or content, fall back to timeout
+	err = page.WaitForSelector(`script#__UNIVERSAL_DATA_FOR_REHYDRATION__, div[data-e2e="user-post-item"], div[data-e2e="search_top-item"], div[data-e2e="search-card-like-container"]`, 5*time.Second)
+	if err != nil {
+		page.WaitForTimeout(2 * time.Second)
+	}
+
+	maxDepth := j.MaxDepth
+	if maxDepth <= 0 {
+		maxDepth = 1
+	}
+
+	if scrollErr := scrollDown(ctx, page, maxDepth); scrollErr != nil {
+		resp.Error = scrollErr
+		return resp
+	}
+
+	if pageResponse != nil {
+		resp.URL = pageResponse.URL
+		resp.StatusCode = pageResponse.StatusCode
+		resp.Headers = pageResponse.Headers
+	}
+
+	if resp.URL == "" {
+		resp.URL = page.URL()
+	}
+
+	captured := getResponses()
+	if len(captured) > 0 {
+		if resp.Meta == nil {
+			resp.Meta = make(map[string]any)
+		}
+		resp.Meta["api_videos"] = captured
+	}
 
 	body, err := page.Content()
 	if err != nil {
@@ -154,6 +210,155 @@ func (j *TikTokJob) BrowserActions(ctx context.Context, page scrapemate.BrowserP
 
 	resp.Body = []byte(body)
 	return resp
+}
+
+func injectCookies(page scrapemate.BrowserPage, pwPage playwright.Page, cookieStr string) {
+	if cookieStr == "" {
+		return
+	}
+
+	if pwPage != nil && pwPage.Context() != nil {
+		var pwCookies []playwright.OptionalCookie
+
+		for _, p := range strings.Split(cookieStr, ";") {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+
+			name, val, ok := strings.Cut(p, "=")
+			if !ok {
+				continue
+			}
+
+			name = strings.TrimSpace(name)
+			val = strings.TrimSpace(val)
+
+			if name == "" {
+				continue
+			}
+
+			isHTTPOnly := name == "sessionid" || name == "tt_chain_token" || name == "ttwid" || name == "msToken"
+			pwCookies = append(pwCookies, playwright.OptionalCookie{
+				Name:     name,
+				Value:    val,
+				Domain:   playwright.String(".tiktok.com"),
+				Path:     playwright.String("/"),
+				Secure:   playwright.Bool(true),
+				HttpOnly: playwright.Bool(isHTTPOnly),
+			})
+		}
+
+		if len(pwCookies) > 0 {
+			_ = pwPage.Context().AddCookies(pwCookies)
+		}
+
+		return
+	}
+
+	for _, p := range strings.Split(cookieStr, ";") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			_, _ = page.Eval(fmt.Sprintf(`document.cookie = %q`, p+"; domain=.tiktok.com; path=/; SameSite=Lax"))
+		}
+	}
+}
+
+func attachAPIInterceptor(pwPage playwright.Page) (func(), func() []map[string]any) {
+	if pwPage == nil {
+		return func() {}, func() []map[string]any { return nil }
+	}
+
+	var (
+		mu        sync.Mutex
+		responses []map[string]any
+	)
+
+	handler := func(pResponse playwright.Response) {
+		reqURL := pResponse.URL()
+		if !strings.Contains(reqURL, "/api/item_list/") &&
+			!strings.Contains(reqURL, "/api/post/item_list/") &&
+			!strings.Contains(reqURL, "/api/search/item/full/") &&
+			!strings.Contains(reqURL, "/api/search/general/full/") &&
+			!strings.Contains(reqURL, "/api/recommend/item_list/") {
+			return
+		}
+
+		if pResponse.Status() < 200 || pResponse.Status() >= 300 {
+			return
+		}
+
+		var data map[string]any
+		if err := pResponse.JSON(&data); err == nil && data != nil {
+			mu.Lock()
+			responses = append(responses, data)
+			mu.Unlock()
+		}
+	}
+
+	pwPage.OnResponse(handler)
+
+	cleanup := func() {
+		pwPage.RemoveListener("response", handler)
+	}
+
+	getResponses := func() []map[string]any {
+		mu.Lock()
+		defer mu.Unlock()
+
+		cp := make([]map[string]any, len(responses))
+		copy(cp, responses)
+
+		return cp
+	}
+
+	return cleanup, getResponses
+}
+
+func scrollDown(ctx context.Context, page scrapemate.BrowserPage, maxDepth int) error {
+	stuckCount := 0
+	lastHeight := 0
+
+	for i := 1; i < maxDepth; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		_, _ = page.Eval(`() => window.scrollTo(0, document.body.scrollHeight)`)
+		page.WaitForTimeout(2000 * time.Millisecond)
+
+		heightVal, evalErr := page.Eval(`() => document.body.scrollHeight`)
+		if evalErr == nil {
+			var currentHeight int
+			switch v := heightVal.(type) {
+			case int:
+				currentHeight = v
+			case float64:
+				currentHeight = int(v)
+			}
+
+			if currentHeight > 0 && currentHeight == lastHeight {
+				stuckCount++
+				if stuckCount >= 3 {
+					break
+				}
+
+				// Jiggle scroll slightly to trigger intersection observer
+				_, _ = page.Eval(`() => {
+					window.scrollBy(0, -200);
+					setTimeout(() => window.scrollTo(0, document.body.scrollHeight), 100);
+				}`)
+				page.WaitForTimeout(1000 * time.Millisecond)
+			} else {
+				stuckCount = 0
+				lastHeight = currentHeight
+			}
+		}
+	}
+
+	return nil
 }
 
 func (j *TikTokJob) Process(ctx context.Context, resp *scrapemate.Response) (any, []scrapemate.IJob, error) {

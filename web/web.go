@@ -119,6 +119,21 @@ func New(svc *Service, addr string) (*Server, error) {
 		ans.apiGetJobPlaces(w, r)
 	})
 
+	mux.HandleFunc("/api/v1/jobs/{id}/tweets", func(w http.ResponseWriter, r *http.Request) {
+		r = requestWithID(r)
+
+		if r.Method != http.MethodGet {
+			ans := apiError{
+				Code:    http.StatusMethodNotAllowed,
+				Message: "Method not allowed",
+			}
+			renderJSON(w, http.StatusMethodNotAllowed, ans)
+			return
+		}
+
+		ans.apiGetJobTweets(w, r)
+	})
+
 	mux.HandleFunc("/api/v1/auth/cookies/{platform}", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			renderJSON(w, http.StatusMethodNotAllowed, apiError{
@@ -264,6 +279,7 @@ type apiScrapeRequest struct {
 	FastMode     bool          `json:"fast_mode"`
 	Radius       int           `json:"radius"`
 	Depth        int           `json:"depth"`
+	MaxResults   int           `json:"max_results,omitempty"`
 	Email        bool          `json:"email"`
 	ExtraReviews bool          `json:"extra_reviews"`
 	MaxTime      time.Duration `json:"max_time"`
@@ -325,6 +341,7 @@ func (s *Server) apiScrape(w http.ResponseWriter, r *http.Request) {
 			FastMode:     req.FastMode,
 			Radius:       req.Radius,
 			Depth:        req.Depth,
+			MaxResults:   req.MaxResults,
 			Email:        req.Email,
 			ExtraReviews: req.ExtraReviews,
 			MaxTime:      req.MaxTime,
@@ -443,6 +460,28 @@ func (s *Server) apiGetJobPlaces(w http.ResponseWriter, r *http.Request) {
 	}
 
 	renderJSON(w, http.StatusOK, places)
+}
+
+func (s *Server) apiGetJobTweets(w http.ResponseWriter, r *http.Request) {
+	id, ok := getIDFromRequest(r)
+	if !ok {
+		apiError := apiError{
+			Code:    http.StatusUnprocessableEntity,
+			Message: "Invalid ID",
+		}
+		renderJSON(w, http.StatusUnprocessableEntity, apiError)
+		return
+	}
+
+	tweets, err := s.svc.GetTweets(r.Context(), id.String())
+	if err != nil {
+		if !errors.Is(err, ErrTweetsNotFound) {
+			log.Printf("api view job tweets %s: %v", id, err)
+		}
+		tweets = []TweetDTO{}
+	}
+
+	renderJSON(w, http.StatusOK, tweets)
 }
 
 func (s *Server) apiDeleteJob(w http.ResponseWriter, r *http.Request) {

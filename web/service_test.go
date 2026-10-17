@@ -111,3 +111,38 @@ func TestGetPlacesRejectsTraversal(t *testing.T) {
 		t.Fatal("expected error for path traversal")
 	}
 }
+
+func TestGetTweetsParsesCSV(t *testing.T) {
+	dir := t.TempDir()
+	svc := NewService(nil, dir)
+
+	csv := "id,url,author_username,author_name,text,created_at,replies,retweets,likes,views,is_reply,is_retweet\n" +
+		"1845123456,https://x.com/jack/status/1845123456,jack,Jack Dorsey,hello world,2026-10-15T12:00:00Z,10,20,30,1000,false,false\n"
+	writeCSV(t, dir, "tweet-job-1", csv)
+
+	tweets, err := svc.GetTweets(context.Background(), "tweet-job-1")
+	if err != nil {
+		t.Fatalf("GetTweets: %v", err)
+	}
+
+	if len(tweets) != 1 {
+		t.Fatalf("expected 1 tweet, got %d", len(tweets))
+	}
+
+	tw := tweets[0]
+	if tw.ID != "1845123456" {
+		t.Errorf("expected ID 1845123456, got %s", tw.ID)
+	}
+	if tw.AuthorUsername != "jack" {
+		t.Errorf("expected username jack, got %s", tw.AuthorUsername)
+	}
+	if tw.AuthorName != "Jack Dorsey" {
+		t.Errorf("expected name Jack Dorsey, got %s", tw.AuthorName)
+	}
+	if tw.Likes != 30 {
+		t.Errorf("expected 30 likes, got %d", tw.Likes)
+	}
+	if tw.Views != 1000 {
+		t.Errorf("expected 1000 views, got %d", tw.Views)
+	}
+}

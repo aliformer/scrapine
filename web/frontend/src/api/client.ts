@@ -1,4 +1,4 @@
-import type { Job, CreateJobRequest, ApiError, Place } from "@/types"
+import type { Job, CreateJobRequest, ApiError, Place, Tweet } from "@/types"
 import { supabase, isSupabaseConfigured } from "@/lib/supabase"
 
 const API_BASE = "/api/v1"
@@ -83,6 +83,14 @@ export async function getJobPlaces(id: string): Promise<Place[]> {
     headers: authHeaders,
   })
   return handleResponse<Place[]>(response)
+}
+
+export async function getJobTweets(id: string): Promise<Tweet[]> {
+  const authHeaders = await getAuthHeaders()
+  const response = await fetch(`${API_BASE}/jobs/${id}/tweets`, {
+    headers: authHeaders,
+  })
+  return handleResponse<Tweet[]>(response)
 }
 
 export async function getJobCSV(id: string): Promise<string> {

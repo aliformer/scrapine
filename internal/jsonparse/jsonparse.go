@@ -177,6 +177,23 @@ func GetString(obj map[string]any, path ...string) string {
 	return ""
 }
 
+// GetBool safely gets a nested boolean value
+func GetBool(obj map[string]any, path ...string) bool {
+	val := getNestedValue(obj, path)
+	switch v := val.(type) {
+	case bool:
+		return v
+	case string:
+		b, err := strconv.ParseBool(v)
+		return err == nil && b
+	case int:
+		return v != 0
+	case float64:
+		return v != 0
+	}
+	return false
+}
+
 // GetInt safely gets a nested int value
 func GetInt(obj map[string]any, path ...string) int {
 	val := getNestedValue(obj, path)
